@@ -15,8 +15,9 @@ Examples: `right arrow`, `greek pi`, `currency`, `U+2192`, or `→`.
 - Keyboard navigation, recent characters, and favorites.
 - Automatic paste on Windows; the selected character also remains on the
   clipboard.
-- Clipboard-first fallback on Linux. Automatic paste uses `xdotool` on X11 or
-  `wtype` on Wayland when installed.
+- Clipboard-first fallback on Linux. Automatic paste tries `wtype` on Wayland
+  or `xdotool` on X11, then falls back to `ydotool` (which works on both,
+  including KDE Plasma Wayland). See [Linux auto-paste](#linux-auto-paste).
 - Dark and light themes that follow the system preference.
 - Tray menu and optional start-at-login on Windows.
 
@@ -66,6 +67,105 @@ Linux packages can be built on Linux with `npm run dist:linux`.
   Modern Electron uses the desktop portal on Wayland; X11 is the most broadly
   compatible path today.
 - Some Unicode characters need an appropriate font to display their glyph.
+
+### Linux auto-paste
+
+Without a helper tool, UniFind copies the selected character to the clipboard
+and you paste it manually with **Ctrl+V**. For automatic insertion, install one
+of the following keystroke tools. UniFind picks the first one that works:
+
+| Session | Preferred | Universal fallback |
+| --- | --- | --- |
+| X11 | `xdotool` | `ydotool` |
+| Wayland (GNOME, wlroots) | `wtype` | `ydotool` |
+| Wayland (KDE Plasma) | `ydotool` | — |
+
+On **KDE Plasma Wayland**, `wtype` does not work because KWin does not implement
+the virtual-keyboard protocol it relies on. Use `ydotool` instead.
+
+#### Installing ydotool
+
+Install both the client and its daemon from your distribution:
+
+```bash
+# Arch / Manjaro
+sudo pacman -S ydotool
+# Fedora
+sudo dnf install ydotool
+# Debian / Ubuntu
+sudo apt install ydotool
+```
+
+`ydotool` injects input through the kernel `uinput` device, so the `ydotoold`
+daemon must be running and your user needs read/write access to `/dev/uinput`.
+
+Start the daemon:
+
+```bash
+ydotoold
+```
+
+If it reports `READY`, you are set. If `ydotool` later complains it cannot reach
+the daemon, export the socket path the daemon printed, for example:
+
+```bash
+export YDOTOOL_SOCKET=/run/user/$(id -u)/.ydotool_socket
+```
+
+To run the daemon without root, grant your user access to `/dev/uinput` with a
+udev rule (create `/etc/udev/rules.d/80-uinput.rules`):
+
+```
+KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"
+```
+
+Add yourself to the `input` group (`sudo usermod -aG input "$USER"`), then log
+out and back in. Alternatively, run `ydotoold` as root.
+
+#### Starting ydotoold with systemd
+
+Running `ydotoold` by hand does not persist across reboots. On systems with
+systemd you can run it as a user service so it starts at login and restarts if
+it exits. This needs no root as long as your user can access `/dev/uinput` (see
+the udev rule above).
+
+Create `~/.config/systemd/user/ydotoold.service`:
+
+```ini
+[Unit]
+Description=ydotoold user daemon (virtual input for UniFind auto-paste)
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=1
+Environment=YDOTOOL_SOCKET=%t/.ydotool_socket
+ExecStart=/usr/bin/ydotoold --socket-path=%t/.ydotool_socket
+ExecReload=/usr/bin/kill -HUP $MAINPID
+KillMode=process
+TimeoutSec=180
+
+[Install]
+WantedBy=default.target
+```
+
+`%t` expands to the user runtime directory (for example `/run/user/1000`), so
+the daemon and `ydotool` clients share the same socket path. Enable and start
+it:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now ydotoold.service
+systemctl --user status ydotoold.service
+```
+
+The service runs for the duration of your graphical login and stops at logout.
+If you want it to run even when you are not logged in, enable lingering with
+`sudo loginctl enable-linger "$USER"`.
+
+Some distributions also ship a system-wide `ydotool.service` (running as root).
+Using the user service above instead keeps the socket owned by your user, which
+avoids socket-permission issues for `ydotool` clients.
 
 ## Search data
 

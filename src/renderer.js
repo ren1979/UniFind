@@ -217,7 +217,13 @@ async function insertSelected() {
   const record = selectedRecord();
   if (!record) return;
   remember(record);
-  await window.unifind.chooseCharacter(record.char, true);
+  const response = await window.unifind.chooseCharacter(record.char, true);
+  // On a successful paste the window is hidden, so no toast is needed. When
+  // auto-paste is unavailable the window stays open and we tell the user the
+  // character is on the clipboard so they can paste it manually.
+  if (response?.ok && response.mode === 'copied') {
+    showToast(`Copied ${record.char} — press Ctrl+V to paste`);
+  }
 }
 
 async function copyText(value, message = 'Copied to clipboard') {

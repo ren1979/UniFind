@@ -1,6 +1,7 @@
 const path = require('node:path');
-const { spawn } = require('node:child_process');
 const { writeFile } = require('node:fs/promises');
+const { registerKdeGlobalShortcut } = require('./kde-global-shortcut');
+const { attemptInsert, availableBackends, describeInsertMechanism } = require('./insert');
 const {
   app,
   BrowserWindow,
@@ -22,6 +23,7 @@ let mainWindow;
 let tray;
 let isQuitting = false;
 let activeShortcut = null;
+let disposeKdeShortcut = null;
 const captureArgument = process.argv.find((argument) => argument.startsWith('--capture-ui='));
 const capturePath = captureArgument ? captureArgument.slice('--capture-ui='.length) : null;
 if (capturePath) activeShortcut = PRIMARY_SHORTCUT;
@@ -117,15 +119,52 @@ function togglePopup() {
   else showPopup();
 }
 
-function registerShortcut() {
-  if (globalShortcut.register(PRIMARY_SHORTCUT, togglePopup)) {
-    activeShortcut = PRIMARY_SHORTCUT;
+function isWaylandSession() {
+  return process.platform === 'linux' && (
+    process.env.XDG_SESSION_TYPE === 'wayland' || Boolean(process.env.WAYLAND_DISPLAY)
+  );
+}
+
+async function registerShortcut() {
+  // On Wayland, Electron's globalShortcut.register() frequently returns true
+  // while the shortcut never actually fires, because the compositor does not
+  // grant X11-style key grabs. Don't trust it there; go straight to the KDE
+  // D-Bus path, which routes the real keypress through KWin.
+  if (!isWaylandSession()) {
+    if (globalShortcut.register(PRIMARY_SHORTCUT, togglePopup)) {
+      activeShortcut = PRIMARY_SHORTCUT;
+      console.log(`UniFind: registered "${PRIMARY_SHORTCUT}" via Electron.`);
+      return;
+    }
+
+    if (globalShortcut.register(FALLBACK_SHORTCUT, togglePopup)) {
+      activeShortcut = FALLBACK_SHORTCUT;
+      console.warn(
+        `UniFind: "${PRIMARY_SHORTCUT}" could not be registered; using fallback "${FALLBACK_SHORTCUT}".`
+      );
+      return;
+    }
+  } else {
+    console.log('UniFind: Wayland session detected; using KDE kglobalaccel for the global shortcut.');
+  }
+
+  // KDE Plasma: register a session-scoped shortcut through KWin over D-Bus.
+  const kde = await registerKdeGlobalShortcut({
+    shortcuts: [PRIMARY_SHORTCUT, FALLBACK_SHORTCUT],
+    onToggle: () => togglePopup()
+  }).catch((error) => ({ ok: false, reason: `exception: ${error.message}` }));
+
+  if (kde.ok) {
+    activeShortcut = kde.shortcut;
+    disposeKdeShortcut = kde.dispose;
+    console.log(`UniFind: registered "${kde.shortcut}" via KDE kglobalaccel (session only).`);
     return;
   }
 
-  if (globalShortcut.register(FALLBACK_SHORTCUT, togglePopup)) {
-    activeShortcut = FALLBACK_SHORTCUT;
-  }
+  console.warn(
+    `UniFind: no global shortcut could be registered (KDE path: ${kde.reason}). ` +
+      'Bind a desktop custom shortcut to launch UniFind instead, which will toggle the window.'
+  );
 }
 
 function appStatus() {
@@ -134,7 +173,7 @@ function appStatus() {
     requestedShortcut: PRIMARY_SHORTCUT,
     shortcutRegistered: Boolean(activeShortcut),
     platform: process.platform,
-    pasteSupport: process.platform === 'win32' ? 'native' : 'best-effort'
+    insertSupport: process.platform === 'win32' ? 'native' : 'best-effort'
   };
 }
 
@@ -186,45 +225,10 @@ function createTray() {
   rebuildTrayMenu();
 }
 
-function spawnDetached(command, args) {
-  return new Promise((resolve) => {
-    const child = spawn(command, args, {
-      detached: true,
-      windowsHide: true,
-      stdio: 'ignore'
-    });
-    child.once('error', () => resolve(false));
-    child.once('spawn', () => {
-      child.unref();
-      resolve(true);
-    });
-  });
-}
-
-async function pasteIntoPreviousApp() {
-  if (process.platform === 'win32') {
-    const script = [
-      'Add-Type -AssemblyName System.Windows.Forms',
-      'Start-Sleep -Milliseconds 90',
-      '[System.Windows.Forms.SendKeys]::SendWait("^v")'
-    ].join('; ');
-    return spawnDetached('powershell.exe', [
-      '-NoProfile', '-NonInteractive', '-STA', '-WindowStyle', 'Hidden', '-Command', script
-    ]);
-  }
-
-  if (process.platform === 'darwin') {
-    return spawnDetached('osascript', [
-      '-e', 'delay 0.09',
-      '-e', 'tell application "System Events" to keystroke "v" using command down'
-    ]);
-  }
-
-  if (process.env.XDG_SESSION_TYPE === 'wayland') {
-    return spawnDetached('wtype', ['-M', 'ctrl', 'v', '-m', 'ctrl']);
-  }
-
-  return spawnDetached('xdotool', ['key', '--clearmodifiers', 'ctrl+v']);
+function logInsertMechanism() {
+  return describeInsertMechanism()
+    .then(({ level, message }) => (level === 'warn' ? console.warn(message) : console.log(message)))
+    .catch((error) => console.error(error));
 }
 
 function isValidCharacter(value) {
@@ -237,11 +241,24 @@ ipcMain.handle('character:choose', async (_event, payload) => {
   }
 
   await clipboard.writeText(payload.character);
-  if (!payload.paste) return { ok: true, mode: 'copied' };
+  if (!payload.insert) return { ok: true, mode: 'copied' };
 
+  // Check whether any insert tool is installed before hiding. If none is, keep
+  // the window visible so the renderer can tell the user to paste manually.
+  if ((await availableBackends()).length === 0) {
+    const reason = 'No insert tool installed. On KDE Wayland, install ydotool for auto-insert.';
+    console.warn(`UniFind: auto-insert unavailable; character copied to clipboard. ${reason}`);
+    return { ok: true, mode: 'copied', reason };
+  }
+
+  // Hide first so keyboard focus returns to the previously active window before
+  // the paste keystroke is delivered, then attempt the insert.
   mainWindow.hide();
-  const pasteStarted = await pasteIntoPreviousApp();
-  return { ok: true, mode: pasteStarted ? 'pasted' : 'copied' };
+  const result = await attemptInsert();
+  if (result.pasted) return { ok: true, mode: 'pasted', backend: result.backend };
+
+  console.warn(`UniFind: ${result.reason}`);
+  return { ok: true, mode: 'copied', reason: result.reason };
 });
 
 ipcMain.on('popup:hide', () => mainWindow?.hide());
@@ -262,7 +279,8 @@ app.whenReady().then(() => {
     return;
   }
 
-  registerShortcut();
+  registerShortcut().then(rebuildTrayMenu).catch((error) => console.error(error));
+  logInsertMechanism().catch((error) => console.error(error));
   createTray();
 
   if (!process.argv.includes('--hidden')) {
@@ -270,10 +288,19 @@ app.whenReady().then(() => {
   }
 });
 
-app.on('second-instance', showPopup);
+app.on('second-instance', togglePopup);
 app.on('activate', showPopup);
 app.on('before-quit', () => { isQuitting = true; });
-app.on('will-quit', () => globalShortcut.unregisterAll());
+app.on('will-quit', (event) => {
+  globalShortcut.unregisterAll();
+  if (!disposeKdeShortcut) return;
+  const dispose = disposeKdeShortcut;
+  disposeKdeShortcut = null;
+  event.preventDefault();
+  Promise.resolve(dispose())
+    .catch(() => {})
+    .finally(() => app.quit());
+});
 app.on('window-all-closed', () => {
   // UniFind lives in the tray until explicitly quit.
 });
